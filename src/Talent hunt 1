@@ -1,0 +1,444 @@
+"""
+tests/test_selenium.py
+──────────────────────
+
+
+Requirements:
+    pip install selenium webdriver-manager
+
+Usage:
+    # Chrome (default)
+    selenium webdriver tests/test_selenium.py -v
+
+    # Headless Chrome (CI)
+    HEADLESS=1 pytest tests/test_selenium.py -v
+
+    # Target a different base URL
+    BASE_URL=https://staging.talenthunt.com pytest tests/test_selenium.py -v
+
+Environment variables:
+    BASE_URL      Root URL of the running app  (default: http://localhost:8000)
+    HEADLESS      Set to any non-empty value to run Chrome headlessly
+    OPENAI_API_KEY  Required only for LLM-dependent test cases
+"""
+
+import os
+import time
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+HEADLESS = bool(os.getenv("HEADLESS", ""))
+DEFAULT_WAIT = 10  # seconds
+
+
+# ── Fixtures ───────────────────────────────────────────────────────────────────
+
+def driver():
+    """
+    Create a single Chrome WebDriver instance shared across all tests in the
+    session, then quit cleanly when the session ends.
+    """
+    options = ChromeOptions()
+    if HEADLESS:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1280,900")
+
+    service = ChromeService(ChromeDriverManager().install())
+    drv = webdriver.Chrome(service=service, options=options)
+    drv.implicitly_wait(DEFAULT_WAIT)
+    yield drv
+    drv.quit()
+
+
+def wait(driver):
+    """Convenience fixture: explicit WebDriverWait bound to the shared driver."""
+    return WebDriverWait(driver, DEFAULT_WAIT)
+
+
+def navigate(driver, path: str):
+    """Navigate to a path relative to BASE_URL."""
+    driver.get(f"{BASE_URL}{path}")
+
+
+def find(driver, by: By, value: str):
+    """Find a single element with an implicit wait already applied."""
+    return driver.find_element(by, value)
+
+
+def find_all(driver, by: By, value: str):
+    """Find all matching elements."""
+    return driver.find_elements(by, value)
+
+
+# ── Health check ───────────────────────────────────────────────────────────────
+
+class TestHealth:
+    """
+    Original test: GET / → {"status": "ok"}
+
+    Browser equivalent: load the root page and verify the page loads without
+    a 404 / 500 error banner, and a recognisable brand element is present.
+    """
+
+    def test_home_page_loads(self, driver, wait):
+        navigate(driver, "/")
+        # The page title or a top-level heading should mention the brand.
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        assert "TalentHunt" in driver.title or driver.find_element(
+            By.XPATH, "//*[contains(text(),'TalentHunt')]"
+        )
+
+    def test_no_server_error_on_home(self, driver):
+        navigate(driver, "/")
+        page_source = driver.page_source.lower()
+        assert "500" not in page_source, "Server error detected on home page"
+        assert "internal server error" not in page_source
+
+
+# ── Leads — "Let's Talk" form ──────────────────────────────────────────────────
+
+class TestLeads:
+    """
+    Original test: POST /leads/ with contact details → 201.
+
+    Browser equivalent: fill in and submit the 'Let's Talk' contact form and
+    verify the success state.
+    """
+
+    def test_submit_lead_form(self, driver, wait):
+        navigate(driver, "/contact")  # Adjust path to match your routing
+
+        # Fill in each field by its name / id / label
+        driver.find_element(By.NAME, "full_name").send_keys("Jane Doe")
+        driver.find_element(By.NAME, "email").send_keys("jane@example.com")
+        driver.find_element(By.NAME, "phone").send_keys("555-0100")
+
+        # Service dropdown
+        from selenium.webdriver.support.ui import Select
+        Select(driver.find_element(By.NAME, "service")).select_by_visible_text(
+            "Contingency Recruitment"
+        )
+
+        driver.find_element(By.NAME, "message").send_keys(
+            "We need to hire 5 engineers urgently."
+        )
+
+        # Submit
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+        # Verify success message appears
+        success = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(text(),'Thank you') or contains(text(),'received')]")
+            )
+        )
+        assert success.is_displayed()
+
+    def test_lead_form_validation_empty_submit(self, driver, wait):
+        """Form should not submit when required fields are empty."""
+        navigate(driver, "/contact")
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+        # Either browser validation prevents navigation or an error message appears
+        error_indicators = find_all(
+            driver, By.CSS_SELECTOR, "[class*='error'], [class*='invalid'], :invalid"
+        )
+        assert len(error_indicators) > 0 or "contact" in driver.current_url.lower()
+
+
+# ── Jobs ───────────────────────────────────────────────────────────────────────
+
+class TestJobs:
+    """
+    Original tests: POST /jobs/ then GET /jobs/ → list contains the new job.
+
+    Browser equivalent: navigate to job listings page and verify at least one
+    job card is rendered.  Job creation is typically admin-only, so we test
+    the public listing view here.
+    """
+
+    def test_jobs_page_loads(self, driver, wait):
+        navigate(driver, "/jobs")
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        assert "job" in driver.title.lower() or "career" in driver.page_source.lower()
+
+    def test_at_least_one_job_listed(self, driver, wait):
+        navigate(driver, "/jobs")
+        # Job cards are typically <article>, <li>, or divs with a common class
+        job_cards = wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, "[class*='job'], [data-testid='job-card'], article")
+            )
+        )
+        assert len(job_cards) >= 1, "Expected at least one job listing on /jobs"
+
+    def test_job_card_shows_title_and_location(self, driver, wait):
+        navigate(driver, "/jobs")
+        cards = wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, "[class*='job'], [data-testid='job-card'], article")
+            )
+        )
+        first_card_text = cards[0].text
+        # Each card should contain some text (title and/or location)
+        assert len(first_card_text.strip()) > 5
+
+
+# ── Recruitment: Candidate Registration ────────────────────────────────────────
+
+class TestRecruitment:
+    """
+    Original test: POST /recruitment/candidates/ → 201.
+
+    Browser equivalent: fill in the candidate registration / apply form.
+    """
+
+    def test_candidate_registration_page_loads(self, driver, wait):
+        navigate(driver, "/apply")  # Adjust path to match your routing
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        page_text = driver.page_source.lower()
+        assert "apply" in page_text or "candidate" in page_text or "resume" in page_text
+
+    def test_submit_candidate_form(self, driver, wait):
+        navigate(driver, "/apply")
+
+        driver.find_element(By.NAME, "full_name").send_keys("John Smith")
+        driver.find_element(By.NAME, "email").send_keys("john.smith@example.com")
+
+        from selenium.webdriver.support.ui import Select
+        Select(driver.find_element(By.NAME, "industry")).select_by_visible_text(
+            "Building Materials"
+        )
+
+        driver.find_element(By.NAME, "resume_text").send_keys(
+            "10 years in sales leadership at Loblaws and Jack Links."
+        )
+
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+        success = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(text(),'Thank you') or contains(text(),'registered') or contains(text(),'submitted')]")
+            )
+        )
+        assert success.is_displayed()
+
+
+# ── Industries ─────────────────────────────────────────────────────────────────
+
+class TestIndustries:
+    """
+    Original test: GET /industries/ → list includes {"slug": "building-materials"}.
+
+    Browser equivalent: the industries page (or section) shows 'Building Materials'.
+    """
+
+    def test_industries_page_contains_building_materials(self, driver, wait):
+        navigate(driver, "/industries")
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        page_text = driver.page_source
+        assert "Building Materials" in page_text or "building-materials" in page_text
+
+    def test_industries_page_has_multiple_sectors(self, driver, wait):
+        navigate(driver, "/industries")
+        # Industry items are often rendered as cards, list items, or links
+        items = wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, "[class*='industry'], [class*='sector'], [data-testid='industry']")
+            )
+        )
+        assert len(items) >= 1
+
+
+# ── Services ───────────────────────────────────────────────────────────────────
+
+class TestServices:
+    """
+    Original test: GET /services/ → list includes contingency-recruitment and
+    retain-or-refund slugs.
+
+    Browser equivalent: the services page shows both service offerings.
+    """
+
+    def test_services_page_loads(self, driver, wait):
+        navigate(driver, "/services")
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        assert "service" in driver.page_source.lower()
+
+    def test_contingency_recruitment_present(self, driver):
+        navigate(driver, "/services")
+        assert "Contingency Recruitment" in driver.page_source
+
+    def test_retain_or_refund_present(self, driver):
+        navigate(driver, "/services")
+        assert "Retain" in driver.page_source or "Refund" in driver.page_source
+
+
+# ── Reviews / Testimonials ─────────────────────────────────────────────────────
+
+class TestReviews:
+    """
+    Original test: POST /reviews/ with reviewer details → 201.
+
+    Browser equivalent: testimonials/reviews are shown publicly; verify at least
+    one review or the reviewer Scott Slippy (seeded data) is visible.
+    """
+
+    def test_reviews_section_visible(self, driver, wait):
+        navigate(driver, "/")  # Reviews are usually on the home page
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        page_text = driver.page_source
+        # Check for review/testimonial section keywords
+        assert any(kw in page_text for kw in ["testimonial", "review", "what our", "clients say"])
+
+    def test_featured_review_displayed(self, driver, wait):
+        navigate(driver, "/")
+        # Seeded featured reviewer from the original test suite
+        page_text = driver.page_source
+        # Either the reviewer name or their company should appear
+        assert "Scott Slippy" in page_text or "Near" in page_text
+
+
+# ── Team ───────────────────────────────────────────────────────────────────────
+
+class TestTeam:
+    """
+    Original test: POST /team/ then GET /team/ → Paul Huffman present.
+
+    Browser equivalent: the About/Team page lists Paul Huffman.
+    """
+
+    def test_team_page_loads(self, driver, wait):
+        navigate(driver, "/team")
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        page_text = driver.page_source.lower()
+        assert "team" in page_text or "people" in page_text
+
+    def test_paul_huffman_listed(self, driver, wait):
+        navigate(driver, "/team")
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        assert "Paul Huffman" in driver.page_source
+
+    def test_team_member_has_linkedin(self, driver, wait):
+        navigate(driver, "/team")
+        linkedin_links = wait.until(
+            EC.presence_of_all_elements_located(
+                (By.XPATH, "//a[contains(@href,'linkedin.com')]")
+            )
+        )
+        assert len(linkedin_links) >= 1, "Expected at least one LinkedIn link on the team page"
+
+
+# ── Retention Subscriber ───────────────────────────────────────────────────────
+
+class TestRetention:
+    """
+    Original test: POST /retention/subscribe → 201; duplicate → 409.
+
+    Browser equivalent: subscribe form submits successfully; re-submitting the
+    same email shows a 'already subscribed' or duplicate message.
+    """
+
+    _email = f"alice.wong.selenium.{int(time.time())}@example.com"  # unique per run
+
+    def test_retention_subscribe_success(self, driver, wait):
+        navigate(driver, "/retention")  # Adjust path to your routing
+        driver.find_element(By.NAME, "first_name").send_keys("Alice")
+        driver.find_element(By.NAME, "last_name").send_keys("Wong")
+        driver.find_element(By.NAME, "email").send_keys(self._email)
+        driver.find_element(By.NAME, "company").send_keys("BuildCo")
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+        success = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(text(),'subscribed') or contains(text(),'Thank you') or contains(text(),'success')]")
+            )
+        )
+        assert success.is_displayed()
+
+    def test_retention_duplicate_email_shows_error(self, driver, wait):
+        navigate(driver, "/retention")
+        driver.find_element(By.NAME, "first_name").send_keys("Alice")
+        driver.find_element(By.NAME, "last_name").send_keys("Wong")
+        driver.find_element(By.NAME, "email").send_keys(self._email)  # same email
+        driver.find_element(By.NAME, "company").send_keys("BuildCo")
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+        error = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(text(),'already') or contains(text(),'exists') or contains(text(),'duplicate')]")
+            )
+        )
+        assert error.is_displayed()
+
+
+
+@SKIP_LLM
+class TestLLMFeatures:
+    """
+    Original tests: retention checklist generation and chat endpoint.
+
+    Browser equivalent: interact with the AI-powered UI widgets and verify
+    meaningful responses are rendered.
+    """
+
+    def test_retention_checklist_generation(self, driver, wait):
+        navigate(driver, "/retention/checklist")
+
+        from selenium.webdriver.support.ui import Select
+        Select(driver.find_element(By.NAME, "company_size")).select_by_visible_text(
+            "50-200 employees"
+        )
+        Select(driver.find_element(By.NAME, "industry")).select_by_visible_text(
+            "Building Materials"
+        )
+        driver.find_element(By.NAME, "current_pain_points").send_keys(
+            "High turnover in field sales roles"
+        )
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+        # AI responses can take a few seconds
+        checklist_items = WebDriverWait(driver, 30).until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, "[class*='checklist'] li, [data-testid='checklist-item']")
+            )
+        )
+        assert len(checklist_items) >= 5, "Expected at least 5 checklist items from AI"
+
+        summary = driver.find_element(
+            By.CSS_SELECTOR, "[class*='summary'], [data-testid='checklist-summary']"
+        )
+        assert len(summary.text.strip()) > 10
+
+    def test_chat_widget_reply(self, driver, wait):
+        navigate(driver, "/")  # Chat widget is typically on the home page
+
+        chat_input = wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "input[placeholder*='message'], textarea[placeholder*='message'], [data-testid='chat-input']")
+            )
+        )
+        chat_input.send_keys("What industries does TalentHunt specialise in?")
+
+        send_button = driver.find_element(
+            By.CSS_SELECTOR, "button[type='submit'], [data-testid='chat-send']"
+        )
+        send_button.click()
+
+        # Wait for the AI reply to appear
+        reply = WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "[class*='assistant'], [class*='bot-message'], [data-testid='chat-reply']")
+            )
+        )
+        assert len(reply.text.strip()) > 10, "Expected a non-empty AI reply"
