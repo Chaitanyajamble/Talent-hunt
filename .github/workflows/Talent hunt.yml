@@ -1,0 +1,192 @@
+# .github/workflows/ci.yml
+#
+# TalentHunt CI Pipeline
+# ──────────────────────
+# Runs on every push and pull-request against main / develop.
+# Steps:
+#   1. Lint      — ruff (fast Python linter)
+#   2. Type-check — mypy
+#   3. Test      — pytest with coverage (LLM tests skipped; no API key in CI)
+#   4. Coverage  — uploads report to Codecov
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Provide a dummy key so config loads without error.
+  # Real LLM tests are skipped when the key is a placeholder.
+  OPENAI_API_KEY: "dummy-key-for-ci"
+  DATABASE_URL: "sqlite+aiosqlite:///./test.db"
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check app/ tests/
+
+  # ────────────────────────────────────────────────────────────────
+  type-check:
+    name: Type-check (mypy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt mypy types-sqlalchemy
+
+      - name: Run mypy
+        run: mypy app/ --ignore-missing-imports --no-strict-optional
+
+  # ────────────────────────────────────────────────────────────────
+  test:
+    name: Test (pytest + coverage)
+    runs-on: ubuntu-latest
+    needs: [lint]   # only run tests if lint passes
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false   # don't break CI if Codecov is unreachable
+# .github/workflows/cd.yml
+#
+# TalentHunt CD Pipeline
+# ──────────────────────
+# Triggered only when CI passes on a push to main.
+# Steps:
+#   1. Build & push Docker image to GitHub Container Registry (GHCR)
+#   2. Deploy to production server via SSH
+
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]          # only deploy after CI has passed
+    branches: [main]
+    types: [completed]
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    permissions:
+      contents: read
+      packages: write         # required to push to GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Docker ──────────────────────────────────────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/talenthunt-api
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── SSH Deploy ───────────────────────────────────────────────
+      # Secrets required in GitHub repository settings:
+      #   DEPLOY_HOST      — IP or hostname of the production server
+      #   DEPLOY_USER      — SSH username
+      #   DEPLOY_SSH_KEY   — private SSH key (PEM, no passphrase)
+      #   DEPLOY_PATH      — absolute path to the app on the server
+      #   OPENAI_API_KEY — production OPENAI key
+      #   DATABASE_URL     — production DB connection string
+
+      - name: Deploy to production via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "=== Pulling latest image ==="
+            echo ${{ secrets.GITHUB_TOKEN }} | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ghcr.io/${{ github.repository }}/talenthunt-api:latest
+
+            echo "=== Restarting container ==="
+            cd ${{ secrets.DEPLOY_PATH }}
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            echo "=== Cleaning up old images ==="
+            docker image prune -f
+
+            echo "=== Deployment complete ==="
