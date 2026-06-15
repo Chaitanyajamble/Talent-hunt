@@ -1,0 +1,1359 @@
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.routers import (
+    industries,
+    services,
+    process,
+    jobs,
+    contact,
+    testimonials,
+    team,
+    ai_features,
+)
+from app.database import init_db
+
+app = FastAPI(
+    title="TalentHunt Inc. API",
+    description="Backend for North America's Preferred Building Materials Recruiter",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Register routers
+app.include_router(industries.router,    prefix="/api/industries",    tags=["Industries"])
+app.include_router(services.router,      prefix="/api/services",      tags=["Services"])
+app.include_router(process.router,       prefix="/api/process",       tags=["4-Step Process"])
+app.include_router(jobs.router,          prefix="/api/jobs",          tags=["Job Board"])
+app.include_router(contact.router,       prefix="/api/contact",       tags=["Contact & Leads"])
+app.include_router(testimonials.router,  prefix="/api/testimonials",  tags=["Testimonials"])
+app.include_router(team.router,          prefix="/api/team",          tags=["Team"])
+app.include_router(ai_features.router,   prefix="/api/ai",            tags=["AI / LLM Features"])
+
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+
+@app.get("/", tags=["Health"])
+async def root():
+    return {
+        "message": "TalentHunt API is running",
+        "docs": "/docs",
+    }
+"""
+Async SQLAlchemy database configuration.
+Uses SQLite for local dev; swap DATABASE_URL for Postgres in production.
+"""
+
+import os
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./talenthunt.db")
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+
+AsyncSessionLocal = sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+class Base(Declarative):
+    pass
+
+
+async def init_db():
+    """Create all tables on startup."""
+    from app import models  # noqa: F401 – ensure models are imported
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_db():
+    """FastAPI dependency – yields a DB session."""
+    async with AsyncSessionLocal() as session:
+        yield session
+"""
+ORM models mirroring every section of talenthuntinc.com.
+"""
+
+from datetime import datetime
+from sqlalchemy import (
+    Column, Integer, String, Text, Boolean,
+    DateTime, ForeignKey, Enum as SAEnum,
+)
+from sqlalchemy.orm import relationship
+import enum
+
+from app.database import Base
+
+
+# ── Enums ─────────────────────────────────────────────────────────────────────
+
+class IndustryType(str, enum.Enum):
+    building_materials = "building_materials"
+    life_sciences      = "life_sciences"
+    industrial         = "industrial"
+    consumer_products  = "consumer_products"
+    technology         = "technology"
+
+
+class ServiceType(str, enum.Enum):
+    contingency_recruitment     = "contingency_recruitment"
+    recruitment_process_solutions = "recruitment_process_solutions"
+    digital_transformation      = "digital_transformation"
+    retain_or_refund            = "retain_or_refund"
+    retention_solutions         = "retention_solutions"
+
+
+class JobStatus(str, enum.Enum):
+    open   = "open"
+    filled  = "filled"
+    closed  = "closed"
+
+
+class LeadServiceChoice(str, enum.Enum):
+    membership_program            = "membership_program"
+    contingency_recruitment       = "contingency_recruitment"
+    recruitment_process_solutions = "recruitment_process_solutions"
+    retain_or_refund              = "retain_or_refund"
+    digital_transformation        = "digital_transformation"
+
+
+# ── Industry ──────────────────────────────────────────────────────────────────
+
+class Industry(Base):
+    __tablename__ = "industries"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    name        = Column(String(120), nullable=False)
+    slug        = Column(String(60), unique=True, nullable=False)
+    type        = Column(SAEnum(IndustryType), nullable=False)
+    description = Column(Text)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+    jobs = relationship("Job", back_populates="industry")
+
+
+# ── Service ───────────────────────────────────────────────────────────────────
+
+class Service(Base):
+    __tablename__ = "services"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    name        = Column(String(120), nullable=False)
+    slug        = Column(String(60), unique=True, nullable=False)
+    type        = Column(SAEnum(ServiceType), nullable=False)
+    description = Column(Text)
+    features    = Column(Text)   # JSON-encoded list of bullet features
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+
+# ── 4-Step Process ────────────────────────────────────────────────────────────
+
+class ProcessStep(Base):
+    __tablename__ = "process_steps"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    step_number = Column(Integer, nullable=False)        # 1-4
+    name        = Column(String(60), nullable=False)     # HUNT / ASSESS / MANAGE / GROW
+    tagline     = Column(String(255))
+    description = Column(Text)
+
+
+# ── Job Board ─────────────────────────────────────────────────────────────────
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    title           = Column(String(200), nullable=False)
+    company         = Column(String(200))
+    location        = Column(String(200))
+    industry_id     = Column(Integer, ForeignKey("industries.id"), nullable=True)
+    service_type    = Column(SAEnum(ServiceType))
+    description     = Column(Text)
+    requirements    = Column(Text)
+    salary_range    = Column(String(100))
+    status          = Column(SAEnum(JobStatus), default=JobStatus.open)
+    is_featured     = Column(Boolean, default=False)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    industry     = relationship("Industry", back_populates="jobs")
+    applications = relationship("JobApplication", back_populates="job")
+
+
+class JobApplication(Base):
+    __tablename__ = "job_applications"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    job_id       = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    full_name    = Column(String(200), nullable=False)
+    email        = Column(String(200), nullable=False)
+    phone        = Column(String(50))
+    resume_text  = Column(Text)          # parsed resume content
+    cover_letter = Column(Text)
+    ai_score     = Column(Integer)       # 0-100, filled by AI screening
+    ai_feedback  = Column(Text)          # AI screening summary
+    created_at   = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship("Job", back_populates="applications")
+
+
+# ── Contact / Lead Form ───────────────────────────────────────────────────────
+
+class Lead(Base):
+    __tablename__ = "leads"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    full_name      = Column(String(200), nullable=False)
+    email          = Column(String(200), nullable=False)
+    phone          = Column(String(50))
+    company        = Column(String(200))
+    service_choice = Column(SAEnum(LeadServiceChoice))
+    message        = Column(Text)
+    is_contacted   = Column(Boolean, default=False)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+
+
+# ── Testimonials ──────────────────────────────────────────────────────────────
+
+class Testimonial(Base):
+    __tablename__ = "testimonials"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    reviewer     = Column(String(200), nullable=False)
+    title        = Column(String(200))
+    company      = Column(String(200))
+    quote        = Column(Text, nullable=False)
+    is_featured  = Column(Boolean, default=False)
+    created_at   = Column(DateTime, default=datetime.utcnow)
+
+
+# ── Team (Meet the Pride) ─────────────────────────────────────────────────────
+
+class TeamMember:
+    __tablename__ = "team_members"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    name         = Column(String(200), nullable=False)
+    role         = Column(String(200))
+    linkedin_url = Column(String(300))
+    photo_url    = Column(String(500))
+    bio          = Column(Text)
+    display_order = Column(Integer, default=0)
+
+
+# ── AI Chat Session ───────────────────────────────────────────────────────────
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(100), unique=True, nullable=False)
+    topic      = Column(String(100), default="retention")   # retention / hiring / general
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    messages = relationship("ChatMessage", back_populates="session")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=False)
+    role       = Column(String(20), nullable=False)   # "user" | "assistant"
+    content    = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship("ChatSession", back_populates="messages")
+
+from __future__ import annotations
+from datetime import datetime
+from typing import Optional, List
+from pydantic import BaseModel, EmailStr, Field
+
+from app.models import IndustryType, ServiceType, JobStatus, LeadServiceChoice
+
+
+# ── Industry ──────────────────────────────────────────────────────────────────
+
+class IndustryBase(BaseModel):
+    name: str
+    slug: str
+    type: IndustryType
+    description: Optional[str] = None
+
+class IndustryCreate(IndustryBase): ...
+
+class IndustryOut(IndustryBase):
+    id: int
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+# ── Service ───────────────────────────────────────────────────────────────────
+
+class ServiceBase(BaseModel):
+    name: str
+    slug: str
+    type: ServiceType
+    description: Optional[str] = None
+    features: Optional[str] = None
+
+class ServiceCreate(ServiceBase): ...
+
+class ServiceOut(ServiceBase):
+    id: int
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+# ── Process Step ──────────────────────────────────────────────────────────────
+
+class ProcessStepBase(BaseModel):
+    step_number: int = Field(..., ge=1, le=4)
+    name: str
+    tagline: Optional[str] = None
+    description: Optional[str] = None
+
+class ProcessStepCreate(ProcessStepBase): ...
+
+class ProcessStepOut(ProcessStepBase):
+    id: int
+    model_config = {"from_attributes": True}
+
+
+# ── Job ───────────────────────────────────────────────────────────────────────
+
+class JobBase(BaseModel):
+    title: str
+    company: Optional[str] = None
+    location: Optional[str] = None
+    industry_id: Optional[int] = None
+    service_type: Optional[ServiceType] = None
+    description: Optional[str] = None
+    requirements: Optional[str] = None
+    salary_range: Optional[str] = None
+    is_featured: bool = False
+
+class JobCreate(JobBase): ...
+
+class JobOut(JobBase):
+    id: int
+    status: JobStatus
+    created_at: datetime
+    updated_at: datetime
+    model_config = {"from_attributes": True}
+
+
+# ── Job Application ───────────────────────────────────────────────────────────
+
+class ApplicationCreate(BaseModel):
+    full_name: str
+    email: EmailStr
+    phone: Optional[str] = None
+    resume_text: str = Field(..., description="Plain-text content of the resume")
+    cover_letter: Optional[str] = None
+
+class ApplicationOut(ApplicationCreate):
+    id: int
+    job_id: int
+    ai_score: Optional[int] = None
+    ai_feedback: Optional[str] = None
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+# ── Lead / Contact ────────────────────────────────────────────────────────────
+
+class LeadCreate(BaseModel):
+    full_name: str
+    email: EmailStr
+    phone: Optional[str] = None
+    company: Optional[str] = None
+    service_choice: Optional[LeadServiceChoice] = None
+    message: Optional[str] = None
+
+class LeadOut(LeadCreate):
+    id: int
+    is_contacted: bool
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+# ── Testimonial ───────────────────────────────────────────────────────────────
+
+class TestimonialBase(BaseModel):
+    reviewer: str
+    title: Optional[str] = None
+    company: Optional[str] = None
+    quote: str
+    is_featured: bool = False
+
+class TestimonialCreate(TestimonialBase): ...
+
+class TestimonialOut(TestimonialBase):
+    id: int
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+# ── Team ──────────────────────────────────────────────────────────────────────
+
+class TeamMemberBase:
+    name: str
+    role: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    photo_url: Optional[str] = None
+    bio: Optional[str] = None
+    display_order: int = 0
+
+class TeamMemberCreate(TeamMemberBase): ...
+
+class TeamMemberOut(TeamMemberBase):
+    id: int
+    model_config = {"from_attributes": True}
+
+
+# ── AI Feature Schemas ────────────────────────────────────────────────────────
+
+class CandidateMatchRequest(BaseModel):
+    job_description: str = Field(..., description="Full job description text")
+    candidate_profiles: List[str] = Field(..., description="List of resume/profile texts")
+
+class CandidateMatchResult(BaseModel):
+    candidate_index: int
+    score: int           # 0-100
+    summary: str
+    strengths: List[str]
+    gaps: List[str]
+
+class CandidateMatchResponse(BaseModel):
+    results: List[CandidateMatchResult]
+
+class ResumeScreenRequest(BaseModel):
+    job_id: int
+    resume_text: str
+
+class ResumeScreenResponse(BaseModel):
+    score: int
+    feedback: str
+    recommended: bool
+
+class JobDescriptionRequest(BaseModel):
+    title: str
+    industry: IndustryType
+    location: str
+    key_responsibilities: Optional[str] = None
+    required_skills: Optional[str] = None
+    salary_range: Optional[str] = None
+
+class JobDescriptionResponse:
+    job_description: str
+
+class InterviewQuestionRequest:
+    job_title: str
+    industry: IndustryType
+    level: str = Field(..., description="entry | mid | senior | executive")
+    num_questions: int = Field(default=10, ge=3, le=20)
+
+class InterviewQuestionResponse:
+    questions: List[str]
+
+class ChatMessageIn:
+    session_id: str
+    message: str
+    topic: str = Field(default="retention", description="retention | hiring | general")
+
+class ChatMessageOut:
+    session_id: str
+    reply: str
+"""
+LLM Service – powers all AI features for TalentHunt:
+"""
+
+import os
+import json
+import logging
+from typing import Any
+
+from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# System personas
+_RECRUITER_SYSTEM = (
+    "You are an expert recruitment consultant at TalentHunt Inc., "
+    "North America's preferred Building Materials recruiter. "
+    "You specialise in talent acquisition across Building Materials, "
+    "Life Sciences, Industrial/Manufacturing, Consumer Products, and Technology. "
+    "Always respond concisely, professionally, and with data-driven insights."
+)
+
+_RETENTION_SYSTEM = (
+    "You are TalentHunt's Retention Coach – an AI assistant that helps "
+    "businesses improve employee retention. You draw on TalentHunt's "
+    "neuroscience-backed methodology and industry best practices. "
+    "Ask clarifying questions when needed and provide actionable advice."
+)
+
+
+# ── Helper ─────────────────────────────────────────────────────────────────────
+
+async def _chat(system: str, user: str, json_mode: bool = False) -> str:
+    """Single-turn chat completion helper."""
+    kwargs: dict[str, Any] = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 1500,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = await client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content.strip()
+
+
+# ── 1. Candidate Matching ──────────────────────────────────────────────────────
+
+async def match_candidates(job_description: str, profiles: list[str]) -> list[dict]:
+    """
+    Score and rank a list of candidate profiles against a job description.
+    Returns a list of dicts with keys: candidate_index, score, summary,
+    strengths, gaps.
+    """
+    numbered = "\n\n".join(
+        f"CANDIDATE {i}:\n{p}" for i, p in enumerate(profiles)
+    )
+    prompt = f"""
+You are evaluating candidates for the following role:
+
+JOB DESCRIPTION:
+{job_description}
+
+CANDIDATES:
+{numbered}
+
+For each candidate return a JSON object inside a "results" array with these keys:
+  candidate_index (int), score (0-100 int), summary (str, ≤60 words),
+  strengths (list of str), gaps (list of str).
+
+Return ONLY valid JSON: {{"results": [...]}}
+"""
+    raw = await _chat(_RECRUITER_SYSTEM, prompt, json_mode=True)
+    data = json.loads(raw)
+    return data.get("results", [])
+
+
+# ── 2. Resume Screening ────────────────────────────────────────────────────────
+
+async def screen_resume(job_description: str, resume_text: str) -> dict:
+    """
+    Score a single resume against a job description.
+    Returns: {score, feedback, recommended}
+    """
+    prompt = f"""
+Evaluate this resume against the job description below.
+
+JOB DESCRIPTION:
+{job_description}
+
+RESUME:
+{resume_text}
+
+Return ONLY valid JSON:
+{{
+  "score": <0-100>,
+  "feedback": "<2-3 sentence summary of fit>",
+  "recommended": <true|false>
+}}
+"""
+    raw = await _chat(_RECRUITER_SYSTEM, prompt, json_mode=True)
+    return json.loads(raw)
+
+
+# ── 3. Job Description Generator ──────────────────────────────────────────────
+
+async def generate_job_description(
+    title: str,
+    industry: str,
+    location: str,
+    key_responsibilities: str = "",
+    required_skills: str = "",
+    salary_range: str = "",
+) -> str:
+    """
+    Generate a polished, inclusive job description for posting on the
+    Building Materials Career job board.
+    """
+    prompt = f"""
+Write a professional, inclusive job description for TalentHunt's job board.
+
+Title: {title}
+Industry: {industry}
+Location: {location}
+Key Responsibilities (hints): {key_responsibilities or 'not provided'}
+Required Skills (hints): {required_skills or 'not provided'}
+Salary Range: {salary_range or 'Competitive, commensurate with experience'}
+
+Structure the JD with these sections:
+  About the Role | Key Responsibilities | What You Bring |
+  What We Offer | About TalentHunt
+
+Keep it engaging, bias-free, and under 600 words.
+Return ONLY the job description text (no JSON wrapper).
+"""
+    return await _chat(_RECRUITER_SYSTEM, prompt)
+
+
+# ── 4. Interview Questions ─────────────────────────────────────────────────────
+
+async def generate_interview_questions(
+    job_title: str,
+    industry: str,
+    level: str,
+    num_questions: int = 10,
+) -> list[str]:
+    """
+    Generate role-specific, behaviour-based interview questions.
+    """
+    prompt = f"""
+Generate {num_questions} interview questions for:
+  Role: {job_title}
+  Industry: {industry}
+  Seniority: {level}
+
+Mix behavioural (STAR-method), situational, and technical questions.
+Return ONLY valid JSON: {{"questions": ["...", ...]}}
+"""
+    raw = await _chat(_RECRUITER_SYSTEM, prompt, json_mode=True)
+    data = json.loads(raw)
+    return data.get("questions", [])
+
+
+# ── 5. Retention Chatbot (multi-turn) ─────────────────────────────────────────
+
+async def retention_chat(history: list[dict], user_message: str) -> str:
+    """
+    Multi-turn retention / hiring advice chatbot.
+    `history` is a list of {"role": "user"|"assistant", "content": "..."} dicts.
+    """
+    messages = [{"role": "system", "content": _RETENTION_SYSTEM}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
+    response = await client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=0.6,
+        max_tokens=600,
+    )
+    return response.choices[0].message.content.strip()
+"""
+Industries router – Building Materials, Life Sciences, Industrial,
+Consumer Products, Technology.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import Industry
+from app.schemas import IndustryCreate, IndustryOut
+
+router = APIRouter()
+
+
+@router.get("/", response_model=list[IndustryOut])
+async def list_industries(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Industry).order_by(Industry.name))
+    return result.scalars().all()
+
+
+@router.get("/{industry_id}", response_model=IndustryOut)
+async def get_industry(industry_id: int, db: AsyncSession = Depends(get_db)):
+    industry = await db.get(Industry, industry_id)
+    if not industry:
+        raise HTTPException(status_code=404, detail="Industry not found")
+    return industry
+
+
+@router.post("/", response_model=IndustryOut, status_code=201)
+async def create_industry(payload: IndustryCreate, db: AsyncSession = Depends(get_db)):
+    industry = Industry(**payload.model_dump())
+    db.add(industry)
+    await db.commit()
+    await db.refresh(industry)
+    return industry
+
+
+@router.put("/{industry_id}", response_model=IndustryOut)
+async def update_industry(
+    industry_id: int,
+    payload: IndustryCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    industry = await db.get(Industry, industry_id)
+    if not industry:
+        raise HTTPException(status_code=404, detail="Industry not found")
+    for k, v in payload.model_dump().items():
+        setattr(industry, k, v)
+    await db.commit()
+    await db.refresh(industry)
+    return industry
+
+
+@router.delete("/{industry_id}", status_code=204)
+async def delete_industry(industry_id: int, db: AsyncSession = Depends(get_db)):
+    industry = await db.get(Industry, industry_id)
+    if not industry:
+        raise HTTPException(status_code=404, detail="Industry not found")
+    await db.delete(industry)
+    await db.commit()
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import Service, ServiceType
+from app.schemas import ServiceCreate, ServiceOut
+
+router = APIRouter()
+
+
+@router.get("/", response_model=list[ServiceOut])
+async def list_services(
+    type: ServiceType | None = Query(None, description="Filter by service type"),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(Service).order_by(Service.name)
+    if type:
+        stmt = stmt.where(Service.type == type)
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/{service_id}", response_model=ServiceOut)
+async def get_service(service_id: int, db: AsyncSession = Depends(get_db)):
+    service = await db.get(Service, service_id)
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return service
+
+
+@router.post("/", response_model=ServiceOut, status_code=201)
+async def create_service(payload: ServiceCreate, db: AsyncSession = Depends(get_db)):
+    service = Service(**payload.model_dump())
+    db.add(service)
+    await db.commit()
+    await db.refresh(service)
+    return service
+
+
+@router.put("/{service_id}", response_model=ServiceOut)
+async def update_service(
+    service_id: int,
+    payload: ServiceCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    service = await db.get(Service, service_id)
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+    for k, v in payload.model_dump().items():
+        setattr(service, k, v)
+    await db.commit()
+    await db.refresh(service)
+    return service
+
+
+@router.delete("/{service_id}", status_code=204)
+async def delete_service(service_id: int, db: AsyncSession = Depends(get_db)):
+    service = await db.get(Service, service_id)
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+    await db.delete(service)
+    await db.commit()
+"""
+4-Step Process router: HUNT → ASSESS → MANAGE → GROW
+Mirrors the "Our 4 step process" section of talenthuntinc.com.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import ProcessStep
+from app.schemas import ProcessStepCreate, ProcessStepOut
+
+router = APIRouter()
+
+
+@router.get("/", response_model=list[ProcessStepOut])
+async def list_steps(db: AsyncSession = Depends(get_db)):
+    """Return all 4 process steps ordered by step number."""
+    result = await db.execute(select(ProcessStep).order_by(ProcessStep.step_number))
+    return result.scalars().all()
+
+
+@router.get("/{step_id}", response_model=ProcessStepOut)
+async def get_step(step_id: int, db: AsyncSession = Depends(get_db)):
+    step = await db.get(ProcessStep, step_id)
+    if not step:
+        raise HTTPException(status_code=404, detail="Process step not found")
+    return step
+
+
+@router.post("/", response_model=ProcessStepOut, status_code=201)
+async def create_step(payload: ProcessStepCreate, db: AsyncSession = Depends(get_db)):
+    step = ProcessStep(**payload.model_dump())
+    db.add(step)
+    await db.commit()
+    await db.refresh(step)
+    return step
+
+
+@router.put("/{step_id}", response_model=ProcessStepOut)
+async def update_step(
+    step_id: int,
+    payload: ProcessStepCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    step = await db.get(ProcessStep, step_id)
+    if not step:
+        raise HTTPException(status_code=404, detail="Process step not found")
+    for k, v in payload.model_dump().items():
+        setattr(step, k, v)
+    await db.commit()
+    await db.refresh(step)
+    return step
+"""
+Job Board router – mirrors buildingmaterialscareer.com integration.
+Includes AI resume screening on application submission (OpenAI).
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import Job, JobApplication, JobStatus, ServiceType
+from app.schemas import (
+    JobCreate, JobOut,
+    ApplicationCreate, ApplicationOut,
+)
+from app.llm.openai_service import screen_resume
+
+router = APIRouter()
+
+
+# ── Jobs CRUD ─────────────────────────────────────────────────────────────────
+
+@router.get("/", response_model=list[JobOut])
+async def list_jobs(
+    status: JobStatus | None = Query(None),
+    industry_id: int | None = Query(None),
+    service_type: ServiceType | None = Query(None),
+    featured: bool | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(Job).order_by(Job.created_at.desc())
+    if status:
+        stmt = stmt.where(Job.status == status)
+    if industry_id:
+        stmt = stmt.where(Job.industry_id == industry_id)
+    if service_type:
+        stmt = stmt.where(Job.service_type == service_type)
+    if featured is not None:
+        stmt = stmt.where(Job.is_featured == featured)
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/{job_id}", response_model=JobOut)
+async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.post("/", response_model=JobOut, status_code=201)
+async def create_job(payload: JobCreate, db: AsyncSession = Depends(get_db)):
+    job = Job(**payload.model_dump(), status=JobStatus.open)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.put("/{job_id}", response_model=JobOut)
+async def update_job(
+    job_id: int,
+    payload: JobCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    for k, v in payload.model_dump().items():
+        setattr(job, k, v)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.patch("/{job_id}/status", response_model=JobOut)
+async def update_job_status(
+    job_id: int,
+    status: JobStatus,
+    db: AsyncSession = Depends(get_db),
+):
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job.status = status
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+# ── Applications ──────────────────────────────────────────────────────────────
+
+async def _run_ai_screening(application_id: int, job_description: str, resume_text: str):
+    """Background task: AI-screen a resume and update the application record."""
+    from app.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        app_obj = await db.get(JobApplication, application_id)
+        if not app_obj:
+            return
+        result = await screen_resume(job_description, resume_text)
+        app_obj.ai_score    = result.get("score", 0)
+        app_obj.ai_feedback = result.get("feedback", "")
+        await db.commit()
+
+
+@router.post("/{job_id}/apply", response_model=ApplicationOut, status_code=201)
+async def apply_for_job(
+    job_id: int,
+    payload: ApplicationCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.open:
+        raise HTTPException(status_code=400, detail="This position is no longer accepting applications")
+
+    application = JobApplication(job_id=job_id, **payload.model_dump())
+    db.add(application)
+    await db.commit()
+    await db.refresh(application)
+
+    # Fire AI screening in the background
+    if job.description:
+        background_tasks.add_task(
+            _run_ai_screening,
+            application.id,
+            job.description,
+            payload.resume_text,
+        )
+
+    return application
+
+
+@router.get("/{job_id}/applications", response_model=list[ApplicationOut])
+async def list_applications(job_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(JobApplication)
+        .where(JobApplication.job_id == job_id)
+        .order_by(JobApplication.ai_score.desc())
+    )
+    return result.scalars().all()
+
+
+@router.get("/{job_id}/applications/{app_id}", response_model=ApplicationOut)
+async def get_application(
+    job_id: int, app_id: int, db: AsyncSession = Depends(get_db)
+):
+    app_obj = await db.get(JobApplication, app_id)
+    if not app_obj or app_obj.job_id != job_id:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return app_obj
+"""
+Contact / Lead Form router.
+Covers the "Let's Talk", "Get in Touch", and "Retention Checklist" forms
+on talenthuntinc.com.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import Lead
+from app.schemas import LeadCreate, LeadOut
+
+router = APIRouter()
+
+
+@router.post("/", response_model=LeadOut, status_code=201)
+async def submit_lead(payload: LeadCreate, db: AsyncSession = Depends(get_db)):
+    """Submit a contact / consultation request ("Let's Talk" form)."""
+    lead = Lead(**payload.model_dump())
+    db.add(lead)
+    await db.commit()
+    await db.refresh(lead)
+    return lead
+
+
+@router.get("/", response_model=list[LeadOut])
+async def list_leads(
+    is_contacted: bool | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """List all leads; optionally filter by contacted status."""
+    stmt = select(Lead).order_by(Lead.created_at.desc())
+    if is_contacted is not None:
+        stmt = stmt.where(Lead.is_contacted == is_contacted)
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/{lead_id}", response_model=LeadOut)
+async def get_lead(lead_id: int, db: AsyncSession = Depends(get_db)):
+    lead = await db.get(Lead, lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead
+
+
+@router.patch("/{lead_id}/mark-contacted", response_model=LeadOut)
+async def mark_contacted(lead_id: int, db: AsyncSession = Depends(get_db)):
+    """Mark a lead as contacted by the TalentHunt team."""
+    lead = await db.get(Lead, lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    lead.is_contacted = True
+    await db.commit()
+    await db.refresh(lead)
+    return lead
+"""
+Testimonials router – "Client Reviews" section of talenthuntinc.com.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import Testimonial
+from app.schemas import TestimonialCreate, TestimonialOut
+
+router = APIRouter()
+
+
+@router.get("/", response_model=list[TestimonialOut])
+async def list_testimonials(
+    featured: bool | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(Testimonial).order_by(Testimonial.created_at.desc())
+    if featured is not None:
+        stmt = stmt.where(Testimonial.is_featured == featured)
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/{testimonial_id}", response_model=TestimonialOut)
+async def get_testimonial(testimonial_id: int, db: AsyncSession = Depends(get_db)):
+    t = await db.get(Testimonial, testimonial_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    return t
+
+
+@router.post("/", response_model=TestimonialOut, status_code=201)
+async def create_testimonial(
+    payload: TestimonialCreate, db: AsyncSession = Depends(get_db)
+):
+    t = Testimonial(**payload.model_dump())
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+@router.put("/{testimonial_id}", response_model=TestimonialOut)
+async def update_testimonial(
+    testimonial_id: int,
+    payload: TestimonialCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    t = await db.get(Testimonial, testimonial_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    for k, v in payload.model_dump().items():
+        setattr(t, k, v)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+@router.delete("/{testimonial_id}", status_code=204)
+async def delete_testimonial(testimonial_id: int, db: AsyncSession = Depends(get_db)):
+    t = await db.get(Testimonial, testimonial_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    await db.delete(t)
+    await db.commit()
+"""
+Team router – "Meet the Leaders of the Pride" section of talenthuntinc.com.
+Pre-seeded with Paul Huffman, Allan Gomes, Kayla Vangorkum, Cristiann Kannen.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import TeamMember
+from app.schemas import TeamMemberCreate, TeamMemberOut
+
+router = APIRouter()
+
+
+@router.get("/", response_model=list[TeamMemberOut])
+async def list_team(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(TeamMember).order_by(TeamMember.display_order, TeamMember.name)
+    )
+    return result.scalars().all()
+
+
+@router.get("/{member_id}", response_model=TeamMemberOut)
+async def get_member(member_id: int, db: AsyncSession = Depends(get_db)):
+    member = await db.get(TeamMember, member_id)
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    return member
+
+
+@router.post("/", response_model=TeamMemberOut, status_code=201)
+async def create_member(
+    payload: TeamMemberCreate, db: AsyncSession = Depends(get_db)
+):
+    member = TeamMember(**payload.model_dump())
+    db.add(member)
+    await db.commit()
+    await db.refresh(member)
+    return member
+
+
+@router.put("/{member_id}", response_model=TeamMemberOut)
+async def update_member(
+    member_id: int,
+    payload: TeamMemberCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    member = await db.get(TeamMember, member_id)
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    for k, v in payload.model_dump().items():
+        setattr(member, k, v)
+    await db.commit()
+    await db.refresh(member)
+    return member
+
+
+@router.delete("/{member_id}", status_code=204)
+async def delete_member(member_id: int, db: AsyncSession = Depends(get_db)):
+    member = await db.get(TeamMember, member_id)
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    await db.delete(member)
+    await db.commit()
+"""
+AI / LLM Features router powered by OpenAI.
+
+Endpoints:
+  POST /api/ai/match-candidates      – rank candidates vs a job description
+  POST /api/ai/screen-resume         – score one resume against a job
+  POST /api/ai/generate-job-description – write a polished JD
+  POST /api/ai/interview-questions   – generate role-specific questions
+  POST /api/ai/chat                  – retention & hiring chatbot (multi-turn)
+"""
+
+import uuid
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import Job, ChatSession, ChatMessage
+from app.schemas import (
+    CandidateMatchRequest, CandidateMatchResponse, CandidateMatchResult,
+    ResumeScreenRequest, ResumeScreenResponse,
+    JobDescriptionRequest, JobDescriptionResponse,
+    InterviewQuestionRequest, InterviewQuestionResponse,
+    ChatMessageIn, ChatMessageOut,
+)
+from app.llm.openai_service import (
+    match_candidates,
+    screen_resume,
+    generate_job_description,
+    generate_interview_questions,
+    retention_chat,
+)
+
+router = APIRouter()
+
+
+# ── 1. Candidate Matching ──────────────────────────────────────────────────────
+
+@router.post("/match-candidates", response_model=CandidateMatchResponse)
+async def api_match_candidates(payload: CandidateMatchRequest):
+    """
+    Rank a list of candidate profiles against a job description using AI.
+    Returns each candidate's fit score (0-100), strengths, and gaps.
+    """
+    if not payload.candidate_profiles:
+        raise HTTPException(status_code=400, detail="At least one candidate profile required")
+
+    results = await match_candidates(
+        payload.job_description,
+        payload.candidate_profiles,
+    )
+    return CandidateMatchResponse(
+        results=[CandidateMatchResult(**r) for r in results]
+    )
+
+
+# ── 2. Resume Screening ────────────────────────────────────────────────────────
+
+@router.post("/screen-resume", response_model=ResumeScreenResponse)
+async def api_screen_resume(
+    payload: ResumeScreenRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    AI-screen a resume against a stored job's description.
+    Returns a score (0-100), qualitative feedback, and recommendation flag.
+    """
+    job = await db.get(Job, payload.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.description:
+        raise HTTPException(status_code=400, detail="Job has no description to screen against")
+
+    result = await screen_resume(job.description, payload.resume_text)
+    return ResumeScreenResponse(**result)
+
+
+# ── 3. Job Description Generator ──────────────────────────────────────────────
+
+@router.post("/generate-job-description", response_model=JobDescriptionResponse)
+async def api_generate_jd(payload: JobDescriptionRequest):
+    """
+    Generate a polished, inclusive job description for the Building Materials
+    career board using AI.
+    """
+    jd = await generate_job_description(
+        title=payload.title,
+        industry=payload.industry.value,
+        location=payload.location,
+        key_responsibilities=payload.key_responsibilities or "",
+        required_skills=payload.required_skills or "",
+        salary_range=payload.salary_range or "",
+    )
+    return JobDescriptionResponse(job_description=jd)
+
+
+# ── 4. Interview Questions ─────────────────────────────────────────────────────
+
+@router.post("/interview-questions", response_model=InterviewQuestionResponse)
+async def api_interview_questions(payload: InterviewQuestionRequest):
+    """
+    Generate role-specific, behaviour-based interview questions using AI.
+    """
+    questions = await generate_interview_questions(
+        job_title=payload.job_title,
+        industry=payload.industry.value,
+        level=payload.level,
+        num_questions=payload.num_questions,
+    )
+    return InterviewQuestionResponse(questions=questions)
+
+
+# ── 5. Retention / Hiring Chatbot ──────────────────────────────────────────────
+
+@router.post("/chat", response_model=ChatMessageOut)
+async def api_chat(
+    payload: ChatMessageIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Multi-turn AI chatbot for retention & hiring advice.
+    Pass a session_id to continue an existing conversation.
+    A new UUID session_id is created if one doesn't exist.
+    Topic: 'retention' | 'hiring' | 'general'
+    """
+    # Get or create session
+    result = await db.execute(
+        select(ChatSession).where(ChatSession.session_id == payload.session_id)
+    )
+    session = result.scalar_one_or_none()
+
+    if not session:
+        session = ChatSession(
+            session_id=payload.session_id or str(uuid.uuid4()),
+            topic=payload.topic,
+        )
+        db.add(session)
+        await db.flush()
+
+    # Load conversation history
+    history_result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session.id)
+        .order_by(ChatMessage.created_at)
+    )
+    history = [
+        {"role": msg.role, "content": msg.content}
+        for msg in history_result.scalars().all()
+    ]
+
+    # Call OpenAI
+    reply = await retention_chat(history, payload.message)
+
+    # Persist both turns
+    db.add(ChatMessage(session_id=session.id, role="user",      content=payload.message))
+    db.add(ChatMessage(session_id=session.id, role="assistant", content=reply))
+    await db.commit()
+
+    return ChatMessageOut(session_id=session.session_id, reply=reply)
