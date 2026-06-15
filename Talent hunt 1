@@ -1,0 +1,785 @@
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
+
+from app.api.v1.router import api_router
+from app.core.config import settings
+from app.core.logging import configure_logging
+from app.db.session import engine
+from app.db import base  # noqa: F401 – registers all ORM models before create_all
+
+configure_logging()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup / shutdown lifecycle hook."""
+    # In production replace with Alembic migrations; kept here for dev convenience.
+    from app.db.session import Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    await engine.dispose()
+
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description=__doc__,
+    version=settings.VERSION,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    docs_url=f"{settings.API_V1_STR}/docs",
+    redoc_url=f"{settings.API_V1_STR}/redoc",
+    lifespan=lifespan,
+)
+
+# ── Middleware ──────────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.BACKEND_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.ALLOWED_HOSTS)
+
+# ── Routers ─────────────────────────────────────────────────────────────────
+app.include_router(api_router, prefix=settings.API_V1_STR)
+
+
+# ── Global exception handler ────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred. Our team has been notified."},
+    )
+
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Liveness probe for container orchestration."""
+    return {"status": "ok", "service": settings.PROJECT_NAME}
+"""
+Centralised configuration – all values come from environment variables.
+Use a .env file locally; inject secrets via CI/CD / Vault in production.
+"""
+
+from __future__ import annotations
+
+from typing import List
+
+from pydantic import AnyHttpUrl, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=True)
+
+    # ── Project ────────────────────────────────────────────────────────────
+    PROJECT_NAME: str = "TalentHunt API"
+    VERSION: str = "1.0.0"
+    API_V1_STR: str = "/api/v1"
+    ENVIRONMENT: str = "development"  # development | staging | production
+
+    # ── Security ───────────────────────────────────────────────────────────
+    SECRET_KEY: str = "CHANGE_ME_IN_PRODUCTION"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # ── Database ───────────────────────────────────────────────────────────
+    DATABASE_URL: str = "sqlite+aiosqlite:///./talenthunt_dev.db"
+    # Production example: postgresql+asyncpg://user:pass@host/db
+
+    # ── CORS / Hosts ───────────────────────────────────────────────────────
+    BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = ["http://localhost:3000", "https://talenthuntinc.com"]
+    ALLOWED_HOSTS: List[str] = ["*"]
+
+    # ── Email (transactional) ──────────────────────────────────────────────
+    SMTP_HOST: str = "smtp.sendgrid.net"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    EMAILS_FROM: str = "noreply@talenthuntinc.com"
+
+    # ── Pagination defaults ────────────────────────────────────────────────
+    DEFAULT_PAGE_SIZE: int = 20
+    MAX_PAGE_SIZE: int = 100
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, v):
+        if isinstance(v, str):
+            return [i.strip() for i in v.split(",")]
+        return v
+
+
+settings = Settings()
+"""
+Security utilities:
+  • Password hashing via bcrypt (passlib)
+  • JWT creation / verification (python-jose)
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+
+from app.core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# ── Password helpers ────────────────────────────────────────────────────────
+
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+# ── JWT helpers ─────────────────────────────────────────────────────────────
+
+def _build_token(subject: Any, expires_delta: timedelta, token_type: str) -> str:
+    expire = datetime.now(timezone.utc) + expires_delta
+    payload = {
+        "sub": str(subject),
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "type": token_type,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_access_token(subject: Any) -> str:
+    return _build_token(
+        subject,
+        timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        "access",
+    )
+
+
+def create_refresh_token(subject: Any) -> str:
+    return _build_token(
+        subject,
+        timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        "refresh",
+    )
+
+
+def decode_token(token: str) -> dict:
+    """Raises JWTError on invalid / expired tokens."""
+    return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+"""
+Structured JSON logging – production-ready, integrates with Datadog / CloudWatch.
+Falls back to readable console output in development.
+"""
+
+import logging
+import sys
+
+from app.core.config import settings
+
+
+def configure_logging() -> None:
+    log_level = logging.DEBUG if settings.ENVIRONMENT == "development" else logging.INFO
+
+    fmt = (
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        if settings.ENVIRONMENT == "development"
+        else '{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}'
+    )
+
+    logging.basicConfig(
+        level=log_level,
+        format=fmt,
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    # Quieten noisy third-party loggers
+    for noisy in ("uvicorn.access", "sqlalchemy.engine"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+"""
+Async SQLAlchemy engine & session factory.
+AsyncSession is injected into endpoints via FastAPI dependency injection.
+"""
+
+from __future__ import annotations
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+from app.core.config import settings
+
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=settings.ENVIRONMENT == "development",
+    pool_pre_ping=True,        # drops stale connections proactively
+    pool_size=10,              # ignored for SQLite; meaningful for Postgres
+    max_overflow=20,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,    # objects remain usable after commit
+    autoflush=False,
+)
+
+
+class Base(DeclarativeBase):
+    """Shared declarative base for all ORM models."""
+
+
+async def get_db() -> AsyncSession:
+    """FastAPI dependency – yields a DB session per request."""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+"""
+Import every ORM model here so SQLAlchemy's metadata is fully populated
+before `Base.metadata.create_all()` is called.
+"""
+
+from app.db.session import Base 
+from app.models.user import User  
+from app.models.candidate import Candidate  
+from app.models.client import Client  
+from app.models.industry import Industry  
+from app.models.job import Job  # noqa
+from app.models.application import Application  
+from app.models.engagement import Engagement  
+from app.models.assessment import Assessment  
+from app.models.contact import ContactSubmission  
+from app.models.review import Review  
+from app.models.blog import BlogPost  
+from app.models.team_member import TeamMember  
+"""
+Shared ORM mixins providing audit fields and soft-delete capability
+for all TalentHunt domain models.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class UUIDPrimaryKeyMixin:
+    """UUID primary key – avoids sequential ID enumeration attacks."""
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True
+    )
+
+
+class TimestampMixin:
+    """Automatic created_at / updated_at audit columns."""
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class SoftDeleteMixin:
+    """Soft-delete: rows are never physically removed, only flagged."""
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def soft_delete(self) -> None:
+        self.is_deleted = True
+        self.deleted_at = _utcnow()
+
+
+class AuditMixin(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
+    """Convenience mixin combining UUID PK + timestamps + soft-delete."""
+"""User model – platform accounts (recruiters, admins, clients, candidates)."""
+
+from __future__ import annotations
+
+import enum
+
+from sqlalchemy import Enum, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class UserRole(str, enum.Enum):
+    ADMIN = "admin"
+    RECRUITER = "recruiter"
+    CLIENT = "client"
+    CANDIDATE = "candidate"
+
+
+class User(AuditMixin, Base):
+    __tablename__ = "users"
+
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.CANDIDATE)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    is_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
+"""User model – platform accounts (recruiters, admins, clients, candidates)."""
+
+from __future__ import annotations
+
+import enum
+
+from sqlalchemy import Enum, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class UserRole(str, enum.Enum):
+    ADMIN = "admin"
+    RECRUITER = "recruiter"
+    CLIENT = "client"
+    CANDIDATE = "candidate"
+
+
+class User(AuditMixin, Base):
+    __tablename__ = "users"
+
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.CANDIDATE)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    is_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
+"""
+Industry model – maps to TalentHunt's 5 verticals:
+Building Materials, Life Sciences/Medical, Industrial/Manufacturing,
+Consumer Products, Technology.
+"""
+
+from sqlalchemy import String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class Industry(AuditMixin, Base):
+    __tablename__ = "industries"
+
+    name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    slug: Mapped[str] = mapped_column(String(120), unique=True, nullable=False, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    icon_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # Relationships
+    jobs: Mapped[list["Job"]] = relationship("Job", back_populates="industry", lazy="selectin")
+    clients: Mapped[list["Client"]] = relationship("Client", back_populates="industry", lazy="selectin")
+"""Job posting – mirrors the buildingmaterialscareer.com job board feed."""
+
+from __future__ import annotations
+
+import enum
+from decimal import Decimal
+
+from sqlalchemy import Enum, ForeignKey, Numeric, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class JobType(str, enum.Enum):
+    FULL_TIME = "full_time"
+    PART_TIME = "part_time"
+    CONTRACT = "contract"
+    TEMPORARY = "temporary"
+
+
+class JobStatus(str, enum.Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    ON_HOLD = "on_hold"
+    FILLED = "filled"
+    CLOSED = "closed"
+
+
+class ExperienceLevel(str, enum.Enum):
+    ENTRY = "entry"
+    MID = "mid"
+    SENIOR = "senior"
+    DIRECTOR = "director"
+    EXECUTIVE = "executive"
+
+
+class Job(AuditMixin, Base):
+    __tablename__ = "jobs"
+
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    requirements: Mapped[str | None] = mapped_column(Text, nullable=True)
+    location: Mapped[str] = mapped_column(String(255), nullable=False)
+    remote_ok: Mapped[bool] = mapped_column(default=False, nullable=False)
+    job_type: Mapped[JobType] = mapped_column(Enum(JobType), nullable=False, default=JobType.FULL_TIME)
+    experience_level: Mapped[ExperienceLevel] = mapped_column(Enum(ExperienceLevel), nullable=False)
+    salary_min: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    salary_max: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    currency: Mapped[str] = mapped_column(String(3), default="CAD", nullable=False)
+    status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), nullable=False, default=JobStatus.DRAFT)
+
+    # FK
+    industry_id: Mapped[str] = mapped_column(ForeignKey("industries.id"), nullable=False)
+    client_id: Mapped[str | None] = mapped_column(ForeignKey("clients.id"), nullable=True)
+
+    # Relationships
+    industry: Mapped["Industry"] = relationship("Industry", back_populates="jobs")
+    client: Mapped["Client | None"] = relationship("Client", back_populates="jobs")
+    applications: Mapped[list["Application"]] = relationship("Application", back_populates="job")
+"""Candidate – a job seeker in the TalentHunt talent pipeline."""
+
+from __future__ import annotations
+
+import enum
+
+from sqlalchemy import Enum, ForeignKey, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class CandidateStatus(str, enum.Enum):
+    ACTIVE = "active"
+    PLACED = "placed"
+    ON_HOLD = "on_hold"
+    WITHDRAWN = "withdrawn"
+
+
+class Candidate(AuditMixin, Base):
+    __tablename__ = "candidates"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), unique=True, nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    linkedin_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    resume_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    years_of_experience: Mapped[int | None] = mapped_column(nullable=True)
+    desired_salary: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[CandidateStatus] = mapped_column(
+        Enum(CandidateStatus), default=CandidateStatus.ACTIVE, nullable=False
+    )
+
+    # Relationships
+    applications: Mapped[list["Application"]] = relationship("Application", back_populates="candidate")
+    assessments: Mapped[list["Assessment"]] = relationship("Assessment", back_populates="candidate")
+    user: Mapped["User"] = relationship("User", lazy="joined")
+"""Client – a hiring company that partners with TalentHunt."""
+
+from __future__ import annotations
+
+from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class Client(AuditMixin, Base):
+    __tablename__ = "clients"
+
+    company_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    website: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    hq_location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    contact_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    contact_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+    industry_id: Mapped[str | None] = mapped_column(ForeignKey("industries.id"), nullable=True)
+
+    # Relationships
+    industry: Mapped["Industry | None"] = relationship("Industry", back_populates="clients")
+    jobs: Mapped[list["Job"]] = relationship("Job", back_populates="client")
+    engagements: Mapped[list["Engagement"]] = relationship("Engagement", back_populates="client")
+    reviews: Mapped[list["Review"]] = relationship("Review", back_populates="client")
+"""Application –  bridge between Candidate and Job."""
+
+from __future__ import annotations
+
+import enum
+
+from sqlalchemy import Enum, ForeignKey, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class ApplicationStatus(str, enum.Enum):
+    SUBMITTED = "submitted"
+    UNDER_REVIEW = "under_review"
+    SHORTLISTED = "shortlisted"
+    INTERVIEWING = "interviewing"
+    OFFER_EXTENDED = "offer_extended"
+    OFFER_ACCEPTED = "offer_accepted"
+    OFFER_DECLINED = "offer_declined"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+
+
+class Application(AuditMixin, Base):
+    __tablename__ = "applications"
+
+    candidate_id: Mapped[str] = mapped_column(ForeignKey("candidates.id"), nullable=False)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), nullable=False)
+    status: Mapped[ApplicationStatus] = mapped_column(
+        Enum(ApplicationStatus), default=ApplicationStatus.SUBMITTED, nullable=False
+    )
+    cover_letter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recruiter_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Relationships
+    candidate: Mapped["Candidate"] = relationship("Candidate", back_populates="applications")
+    job: Mapped["Job"] = relationship("Job", back_populates="applications")
+"""
+Engagement – a recruitment mandate awarded by a Client.
+Maps to TalentHunt service types: Contingency, RPO, Digital Transformation,
+Retain-or-Refund.
+"""
+
+from __future__ import annotations
+
+import enum
+from datetime import date
+from decimal import Decimal
+
+from sqlalchemy import Date, Enum, ForeignKey, Numeric, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class EngagementType(str, enum.Enum):
+    CONTINGENCY = "contingency"
+    RPO = "rpo"                          # Recruitment Process Solutions
+    DIGITAL_TRANSFORMATION = "digital_transformation"
+    RETAIN_OR_REFUND = "retain_or_refund"
+    MEMBERSHIP = "membership"
+
+
+class EngagementStatus(str, enum.Enum):
+    DISCOVERY = "discovery"
+    ACTIVE = "active"
+    FULFILLED = "fulfilled"
+    ON_HOLD = "on_hold"
+    CANCELLED = "cancelled"
+
+
+class Engagement(AuditMixin, Base):
+    __tablename__ = "engagements"
+
+    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id"), nullable=False)
+    recruiter_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    engagement_type: Mapped[EngagementType] = mapped_column(Enum(EngagementType), nullable=False)
+    status: Mapped[EngagementStatus] = mapped_column(
+        Enum(EngagementStatus), default=EngagementStatus.DISCOVERY, nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    fee_percentage: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    flat_fee: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+
+    # Relationships
+    client: Mapped["Client"] = relationship("Client", back_populates="engagements")
+    recruiter: Mapped["User"] = relationship("User")
+"""
+Assessment – neuroscience-based talent evaluation as described in the
+TalentHunt 4-step process (HUNT → ASSESS → MANAGE → GROW).
+"""
+
+from __future__ import annotations
+
+import enum
+
+from sqlalchemy import Enum, ForeignKey, JSON, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class AssessmentType(str, enum.Enum):
+    COGNITIVE = "cognitive"
+    PERSONALITY = "personality"
+    EMOTIONAL_INTELLIGENCE = "emotional_intelligence"
+    TECHNICAL = "technical"
+    CULTURAL_FIT = "cultural_fit"
+
+
+class AssessmentStatus(str, enum.Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    EXPIRED = "expired"
+
+
+class Assessment(AuditMixin, Base):
+    __tablename__ = "assessments"
+
+    candidate_id: Mapped[str] = mapped_column(ForeignKey("candidates.id"), nullable=False)
+    assessment_type: Mapped[AssessmentType] = mapped_column(Enum(AssessmentType), nullable=False)
+    status: Mapped[AssessmentStatus] = mapped_column(
+        Enum(AssessmentStatus), default=AssessmentStatus.PENDING, nullable=False
+    )
+    provider: Mapped[str | None] = mapped_column(String(120), nullable=True)  # e.g. "HireVue", "Predictive Index"
+    score: Mapped[float | None] = mapped_column(nullable=True)
+    max_score: Mapped[float | None] = mapped_column(nullable=True)
+    results_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # flexible results payload
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recruiter_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Relationships
+    candidate: Mapped["Candidate"] = relationship("Candidate", back_populates="assessments")
+"""ContactSubmission – "Let's Talk" form submissions from the homepage."""
+
+from __future__ import annotations
+
+import enum
+
+from sqlalchemy import Enum, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class ServiceInterest(str, enum.Enum):
+    MEMBERSHIP = "membership"
+    CONTINGENCY = "contingency"
+    RPO = "rpo"
+    RETAIN_OR_REFUND = "retain_or_refund"
+    DIGITAL_TRANSFORMATION = "digital_transformation"
+
+
+class ContactStatus(str, enum.Enum):
+    NEW = "new"
+    CONTACTED = "contacted"
+    CONVERTED = "converted"
+    CLOSED = "closed"
+
+
+class ContactSubmission(AuditMixin, Base):
+    __tablename__ = "contact_submissions"
+
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    service_interest: Mapped[ServiceInterest | None] = mapped_column(Enum(ServiceInterest), nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[ContactStatus] = mapped_column(
+        Enum(ContactStatus), default=ContactStatus.NEW, nullable=False
+    )
+    source: Mapped[str | None] = mapped_column(String(120), nullable=True)  # e.g. "homepage", "popup"
+"""Review – client testimonials displayed on the homepage."""
+
+from __future__ import annotations
+
+from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class Review(AuditMixin, Base):
+    __tablename__ = "reviews"
+
+    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id"), nullable=False)
+    reviewer_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    reviewer_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    rating: Mapped[int | None] = mapped_column(Integer, nullable=True)   # 1-5
+    is_featured: Mapped[bool] = mapped_column(default=False, nullable=False)
+    avatar_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    client: Mapped["Client"] = relationship("Client", back_populates="reviews")
+"""BlogPost – CMS entries from the Resources / Blog section."""
+
+from __future__ import annotations
+
+import enum
+from datetime import datetime
+
+from sqlalchemy import DateTime, Enum, ForeignKey, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class PostStatus(str, enum.Enum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
+class BlogPost(AuditMixin, Base):
+    __tablename__ = "blog_posts"
+
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    slug: Mapped[str] = mapped_column(String(512), unique=True, nullable=False, index=True)
+    excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    cover_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[PostStatus] = mapped_column(Enum(PostStatus), default=PostStatus.DRAFT, nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    author_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    author: Mapped["User | None"] = relationship("User")
+"""TeamMember – "Meet the Pride" section on the homepage."""
+
+from sqlalchemy import Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.session import Base
+from app.models.mixins import AuditMixin
+
+
+class TeamMember(AuditMixin, Base):
+    __tablename__ = "team_members"
+
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    photo_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    linkedin_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
