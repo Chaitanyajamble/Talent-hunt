@@ -1,0 +1,176 @@
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+import heapq
+
+
+# ---------------------------------------------------------------------------
+# 1. TRIE — used for instant skill / job-title autocomplete as a recruiter types
+# ---------------------------------------------------------------------------
+class TrieNode:
+    def __init__(self):
+        self.children: dict[str, "TrieNode"] = {}
+        self.is_end = False
+
+
+class Trie:
+    """Prefix tree for O(prefix length) autocomplete lookups."""
+
+    def __init__(self):
+        self.root = TrieNode()
+
+    def insert(self, word: str) -> None:
+        node = self.root
+        for ch in word.lower():
+            node = node.children.setdefault(ch, TrieNode())
+        node.is_end = True
+
+    def _collect(self, node: TrieNode, prefix: str, results: list[str]) -> None:
+        if node.is_end:
+            results.append(prefix)
+        for ch, child in node.children.items():
+            self._collect(child, prefix + ch, results)
+
+    def autocomplete(self, prefix: str) -> list[str]:
+        node = self.root
+        for ch in prefix.lower():
+            if ch not in node.children:
+                return []
+            node = node.children[ch]
+        results: list[str] = []
+        self._collect(node, prefix.lower(), results)
+        return sorted(results)
+
+
+# ---------------------------------------------------------------------------
+# Candidate model
+# ---------------------------------------------------------------------------
+@dataclass
+class Candidate:
+    id: int
+    name: str
+    skills: set[str]
+    years_experience: int
+    location: str
+
+
+# ---------------------------------------------------------------------------
+# 2 & 3 & 4. HASHMAP index + SET matching + GRAPH of related skills
+# ---------------------------------------------------------------------------
+class CandidateIndex:
+    """
+    Inverted index (hashmap of sets) mapping skill -> candidate IDs.
+    Gives O(1) lookup of "which candidates know skill X" instead of
+    scanning every candidate record.
+    """
+
+    def __init__(self):
+        self.candidates: dict[int, Candidate] = {}
+        self.skill_index: dict[str, set[int]] = defaultdict(set)
+        # Simple skill-adjacency graph: related/transferable skills
+        self.skill_graph: dict[str, set[str]] = defaultdict(set)
+
+    def add_candidate(self, candidate: Candidate) -> None:
+        self.candidates[candidate.id] = candidate
+        for skill in candidate.skills:
+            self.skill_index[skill.lower()].add(candidate.id)
+
+    def link_related_skills(self, skill_a: str, skill_b: str) -> None:
+        """Undirected edge: knowing one skill suggests adjacency to the other."""
+        a, b = skill_a.lower(), skill_b.lower()
+        self.skill_graph[a].add(b)
+        self.skill_graph[b].add(a)
+
+    def expand_with_related(self, required_skills: set[str]) -> set[str]:
+        """BFS one hop out on the skill graph to include related skills."""
+        expanded = set(s.lower() for s in required_skills)
+        for skill in list(expanded):
+            expanded |= self.skill_graph.get(skill, set())
+        return expanded
+
+    def candidates_with_any_skill(self, skills: set[str]) -> set[int]:
+        ids: set[int] = set()
+        for skill in skills:
+            ids |= self.skill_index.get(skill.lower(), set())
+        return ids
+
+
+# ---------------------------------------------------------------------------
+# 5. MIN-HEAP — rank and return only the top-K best-matching candidates
+# ---------------------------------------------------------------------------
+def score_candidate(candidate: Candidate, required_skills: set[str]) -> float:
+    """Simple relevance score: skill overlap ratio + experience bonus."""
+    required = {s.lower() for s in required_skills}
+    matched = required & {s.lower() for s in candidate.skills}
+    if not required:
+        return 0.0
+    overlap_score = len(matched) / len(required)
+    experience_bonus = min(candidate.years_experience, 10) * 0.02
+    return round(overlap_score + experience_bonus, 4)
+
+
+def top_k_candidates(
+    index: CandidateIndex, required_skills: set[str], k: int = 3
+) -> list[tuple[float, Candidate]]:
+    """
+    Uses a fixed-size min-heap to keep only the top K scored candidates
+    while scanning the (much larger) candidate pool once -> O(n log k)
+    instead of sorting everything -> O(n log n).
+    """
+    expanded_skills = index.expand_with_related(required_skills)
+    pool_ids = index.candidates_with_any_skill(expanded_skills)
+
+    heap: list[tuple[float, int, Candidate]] = [] # (score, id, candidate)
+    for cid in pool_ids:
+        candidate = index.candidates[cid]
+        score = score_candidate(candidate, required_skills)
+        if len(heap) < k:
+            heapq.heappush(heap, (score, cid, candidate))
+        elif score > heap[0][0]:
+            heapq.heapreplace(heap, (score, cid, candidate))
+
+    # 6. SORTING — final presentation order, highest score first
+    ranked = sorted(heap, key=lambda item: item[0], reverse=True)
+    return [(score, candidate) for score, _, candidate in ranked]
+
+
+# ---------------------------------------------------------------------------
+# Demo run
+# ---------------------------------------------------------------------------
+def main():
+    index = CandidateIndex()
+    skill_trie = Trie()
+
+    sample_candidates = [
+        Candidate(1, "Ada Lin", {"Python", "Django", "PostgreSQL"}, 6, "Remote"),
+        Candidate(2, "Marco Reyes", {"Python", "FastAPI", "Docker", "AWS"}, 4, "NYC"),
+        Candidate(3, "Priya Nair", {"Java", "Spring", "Kubernetes"}, 8, "Remote"),
+        Candidate(4, "Sam O'Neil", {"Python", "Flask", "AWS", "Terraform"}, 3, "Austin"),
+        Candidate(5, "Elena Vos", {"Python", "Django", "AWS", "Docker"}, 9, "Remote"),
+    ]
+
+    for c in sample_candidates:
+        index.add_candidate(c)
+        for skill in c.skills:
+            skill_trie.insert(skill)
+
+    # Skill graph: e.g., Flask/Django devs can often transfer to FastAPI, and vice versa
+    index.link_related_skills("Flask", "FastAPI")
+    index.link_related_skills("Django", "FastAPI")
+    index.link_related_skills("Docker", "AWS")
+
+    print("=== 1. Trie autocomplete for 'py' ===")
+    print(skill_trie.autocomplete("py"))
+
+    print("\n=== 2/3/4. Candidates matching required skills {Python, AWS} ===")
+    required = {"Python", "AWS"}
+    matches = index.candidates_with_any_skill(index.expand_with_related(required))
+    print([index.candidates[i].name for i in matches])
+
+    print("\n=== 5/6. Top 3 ranked candidates for {Python, AWS} ===")
+    for score, candidate in top_k_candidates(index, required, k=3):
+        print(f" {candidate.name:12s} score={score:.3f} skills={sorted(candidate.skills)}")
+
+
+if __name__ == "__main__":
+    main()
